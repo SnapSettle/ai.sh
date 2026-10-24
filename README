@@ -1,0 +1,164 @@
+# ai.sh
+
+A tiny AI assistant for your terminal, written in plain POSIX `sh`.
+Ask a question or describe a task; it answers or suggests a shell command and runs it **only after you approve**.
+
+- Works with **Anthropic**, **OpenAI** and **Ollama** (local, no API key)
+- One-shot mode and an interactive **chat/agent mode** that can run several commands in a row
+- Saved conversations (or `--temp-session` to save nothing)
+- No dependencies besides `curl` and `jq`
+
+```console
+$ ai.sh "list files larger than 100MB"
+$ ai.sh --chat
+$ ai.sh -y "show disk usage per directory"      # auto-approve commands
+```
+
+## Install
+
+Pick **one** way.
+
+### Any Linux / macOS (bash, zsh, fish, dash, ...)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/snapsettle/ai.sh/main/install.sh | sh
+```
+
+No `curl`? Use `wget`:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/snapsettle/ai.sh/main/install.sh | sh
+```
+
+This puts `ai.sh` (and a short alias `ai`) in `~/.local/bin` and checks the download against a checksum.
+If `~/.local/bin` is not in your `PATH`, the installer prints the exact line to add for your shell.
+
+You also need `jq` (`sudo apt install jq`, `brew install jq`, `sudo pacman -S jq`, ...).
+Windows: use WSL.
+
+Options (put them before `sh`):
+
+| What | How |
+| --- | --- |
+| Install a specific version | `curl -fsSL .../install.sh \| AI_SH_VERSION=2026.10.25 sh` |
+| Install somewhere else | `curl -fsSL .../install.sh \| AI_SH_INSTALL_DIR=/usr/local/bin sh` |
+| Uninstall | `curl -fsSL .../install.sh \| sh -s -- --uninstall` |
+
+### NixOS / Nix
+
+Nix users never run `--update`. Nix replaces the whole package when you rebuild.
+
+**With flakes (recommended)**: in your `flake.nix`:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    ai-sh = {
+      url = "github:snapsettle/ai.sh";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { nixpkgs, ai-sh, ... }: {
+    nixosConfigurations.YOUR-HOSTNAME = nixpkgs.lib.nixosSystem {
+      modules = [
+        ./configuration.nix
+        { nixpkgs.overlays = [ ai-sh.overlays.default ]; }
+      ];
+    };
+  };
+}
+```
+
+then in `configuration.nix`:
+
+```nix
+{ pkgs, ... }: {
+  environment.systemPackages = [ pkgs.ai-sh ];
+}
+```
+
+Rebuild with `sudo nixos-rebuild switch --flake .` and the commands `ai.sh` and `ai` are available.
+Home Manager works the same way: `home.packages = [ pkgs.ai-sh ];`.
+
+**Without flakes**: in `configuration.nix`:
+
+```nix
+{ pkgs, ... }:
+let
+  src = builtins.fetchTarball "https://github.com/snapsettle/ai.sh/archive/refs/heads/main.tar.gz";
+  ai-sh = pkgs.callPackage "${src}/package.nix" { inherit src; };
+in
+{
+  environment.systemPackages = [ ai-sh ];
+}
+```
+
+**Just try it** (nothing installed): `nix run github:snapsettle/ai.sh -- "your request"`
+**Install for your user**: `nix profile install github:snapsettle/ai.sh`
+
+## Update
+
+| How you installed | How to update |
+| --- | --- |
+| One-liner / manual | `ai.sh --update` |
+| Nix flake | `nix flake update ai-sh` then `sudo nixos-rebuild switch --flake .` |
+| Nix without flakes | `sudo nixos-rebuild switch` (Nix re-downloads about once an hour) |
+
+`ai.sh --update` downloads the newest release, verifies its checksum and syntax, then replaces itself.
+At most once a day ai.sh quietly checks for a newer version and tells you if there is one.
+Turn that off with `export SH_AI_NO_UPDATE_CHECK=1`.
+Running `ai.sh --update` on a Nix install does nothing except explain the Nix way.
+
+## First run
+
+Run `ai.sh` once in a terminal. A short setup asks which provider(s) you use and for an API key
+(or reads `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from your environment). Change it later with `ai.sh --reconfig`.
+
+## Usage
+
+```text
+ai.sh [options] "request"          One-shot mode
+ai.sh --chat [options] ["message"] Conversation mode
+```
+
+| Option | What it does |
+| --- | --- |
+| `-y`, `--yolo` | Flip auto-approval of commands (off by default). Deleting chats always asks. |
+| `--chat`, `--convo` | Interactive conversation mode |
+| `--temp-session` | Chat without saving anything to disk |
+| `--update` | Update to the newest release (not for Nix) |
+| `--reconfig` | Change settings |
+| `--reset`, `--reset-config`, `--reset-convos` | Delete everything / settings / saved chats |
+| `--version`, `-h`, `--help` | Version / help |
+
+Inside a chat: `/exit` leaves (chat is kept), `/delete` leaves and deletes it, `/help` lists commands.
+
+Environment variables: `SH_AI_PROVIDER`, `SH_AI_MODEL`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`OLLAMA_HOST`, `SH_AI_DIR`, `SH_AI_NO_UPDATE_CHECK`, `NO_COLOR`.
+
+Settings and chats live in `~/.cache/ai.sh` (or `$SH_AI_DIR`). The config file is readable only by you.
+
+### Safety
+
+- Commands are shown and **need your approval** unless you use `-y`.
+- Even with `-y`, anything that does not look like a real command, and every chat deletion, still asks first.
+- You are running commands an AI wrote. Read them, especially with `-y`.
+
+## Versions
+
+Versions are dates: `2026.10.25`, or `2026.10.25.1` for a second release on the same day.
+Every release is on the [Releases page](https://github.com/snapsettle/ai.sh/releases).
+`ai.sh --version` shows what you have. A copy run straight from a git checkout shows `dev`.
+
+## For maintainers: how releases work (nothing to do by hand)
+
+1. Edit `ai.sh` and push to `main`.
+2. GitHub Actions (`.github/workflows/release.yml`) checks the script, picks today's date as the version,
+   writes it into `ai.sh`, commits it back, tags `vYYYY.MM.DD`, and publishes a Release.
+3. One-liner users get it via `ai.sh --update`. Nix users get it when they update their input / rebuild.
+
+One-time GitHub setup: **Settings → Actions → General → Workflow permissions → Read and write permissions**.
+After each release the bot adds one commit, so run `git pull` before your next push.
+Never edit the `VERSION=` line yourself.
