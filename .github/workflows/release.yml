@@ -1,0 +1,82 @@
+# Automatic releases. Every push to main that changes ai.sh:
+#   1. checks the script,
+#   2. picks a date version (2026.10.25, or 2026.10.25.1 for a second release that day),
+#   3. writes that version into ai.sh and commits it back,
+#   4. tags it and publishes a GitHub Release with the files the installer and
+#      "ai.sh --update" download.
+# You never edit the version yourself. Nix users get the same stamped file.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [ai.sh]
+  workflow_dispatch: # lets you press "Run workflow" in the Actions tab
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Do not react to the bot's own version commit.
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needed to see existing tags
+
+      - name: Check the script
+        run: |
+          sh -n ai.sh
+          shellcheck -S warning ai.sh
+
+      - name: Pick the version
+        id: ver
+        run: |
+          day=$(date -u +%Y.%m.%d)
+          n=$(git tag -l "v$day" "v$day.*" | wc -l)
+          if [ "$n" -eq 0 ]; then version="$day"; else version="$day.$n"; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp the version into ai.sh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          sed -i "s/^VERSION=.*/VERSION=\"$VERSION\"/" ai.sh
+          sh -n ai.sh
+          test "$(sh ./ai.sh --version)" = "ai.sh $VERSION"
+
+      - name: Build release files
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir dist
+          cp ai.sh dist/ai.sh
+          printf '%s\n' "$VERSION" > dist/VERSION
+          cd dist
+          sha256sum ai.sh > ai.sh.sha256
+
+      - name: Commit the stamped version and tag it
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ai.sh
+          git commit -m "release: v$VERSION [skip ci]"
+          git pull --rebase origin main
+          git tag "v$VERSION"
+          git push origin HEAD:main "v$VERSION"
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/ai.sh dist/ai.sh.sha256 dist/VERSION \
+            --title "v$VERSION" --generate-notes
