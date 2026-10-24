@@ -5,7 +5,7 @@
 
 # VERSION is stamped automatically by .github/workflows/release.yml on every
 # release. Do not edit it by hand ("dev" means "running from a git checkout").
-VERSION="2026.10.24"
+VERSION="2026.10.24.1"
 # package.nix changes this to "nix". Nix installs must never update themselves.
 INSTALL_METHOD="script"
 APP="ai.sh"
