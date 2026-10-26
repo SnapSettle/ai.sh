@@ -1,5 +1,8 @@
 # ai.sh
 
+> [!NOTE]
+> This project is a part of [SnapCore](https://github.com/SnapSettle/snapcore)!
+
 A tiny AI assistant for your terminal, written in plain POSIX `sh`.
 Ask a question or describe a task; it answers or suggests a shell command and runs it **only after you approve**.
 
@@ -13,6 +16,9 @@ $ ai.sh "list files larger than 100MB"
 $ ai.sh --chat
 $ ai.sh -y "show disk usage per directory"      # auto-approve commands
 ```
+
+> [!NOTE]
+> Quick terminal tasks shouldn't require bloated apps or shell-specific setups. `ai.sh` gives you a minimal, lightweight alternative that works anywhere without getting in your way. If you already love your current ecosystem helpers, by all means, stick with them! But if you just want something simple that gets straight to the point, you're in the right place.
 
 ## Install
 
