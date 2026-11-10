@@ -24,6 +24,8 @@ STTY_OFF=""
 HIST=""
 CONVO_ID=""
 MODE="oneshot"
+ENV_FACTS=""
+FACTS=""
 
 # =========================================================================
 # Cleanup / exit handling
@@ -234,12 +236,21 @@ USAGE
 
 MODES
   One-shot   Sends your request, shows the answer or a suggested command,
-             runs it after approval, then exits.
+             runs it after approval, then exits. If the command fails, the
+             error is sent back once and you may get one corrected command
+             (you always approve it, even in auto-approve mode).
   Conversation (--convo, --chat)
              Interactive chat. The model can answer, run several commands in
              a row (seeing their output), and read or delete saved
              conversations. Inside the chat: /exit leaves (chat is kept),
              /delete leaves and deletes the active chat, /help lists commands.
+
+LIVE LOOKUPS
+  For requests about services, containers or processes (for example
+  "restart nginx"), ai.sh first runs quick read-only lookups on this machine
+  (systemd, Docker/Podman, pm2, supervisor, running processes) and sends only
+  the few matching names to the model, so it uses real names instead of
+  guessing. Set SH_AI_NO_PROBE to turn this off.
 
 OPTIONS
   -y, --y, --yolo   Toggle auto-approval of commands (flips the configured
@@ -266,6 +277,7 @@ ENVIRONMENT VARIABLES
   OPENAI_API_KEY         OpenAI key (overrides the saved key)
   OLLAMA_HOST            Ollama server URL (overrides the saved host)
   SH_AI_DIR              Override the data directory
+  SH_AI_NO_PROBE         Set to any value to turn off the live lookups
   SH_AI_NO_UPDATE_CHECK  Set to any value to turn off the daily update notice
   SH_AI_UPDATE_URL       Where --update downloads releases from
   NO_COLOR               Disable colors
@@ -280,6 +292,7 @@ EXAMPLES
   ai.sh "list files larger than 100MB"
   ai.sh -y "show disk usage per directory"
   ai.sh "explain what the sort command does"
+  ai.sh "stop the paperback bot service"
   ai.sh --chat
   ai.sh --chat --temp-session "help me debug this script"
   SH_AI_PROVIDER=ollama ai.sh "show listening ports"
@@ -1103,17 +1116,185 @@ set_icon
 update_notice
 
 # =========================================================================
+# Machine facts: what the model needs to give correct commands
+#   1. env_facts    Cheap, always sent (distro, init system, root/sudo, tools)
+#   2. gather_facts Read-only lookups, only for service/container/process
+#                   requests, only the matching lines are sent (names only)
+#   Works the same for every provider: the facts are plain text in the prompt.
+# =========================================================================
+env_facts() { # sets ENV_FACTS once
+  [ -z "$ENV_FACTS" ] || return 0
+  distro=""
+  if [ -r /etc/os-release ]; then
+    distro=$(
+      . /etc/os-release 2>/dev/null
+      printf '%s' "${PRETTY_NAME:-${NAME:-}}"
+    )
+  fi
+  if [ -z "$distro" ] && command -v sw_vers >/dev/null 2>&1; then
+    distro="macOS $(sw_vers -productVersion 2>/dev/null)"
+  fi
+  [ -n "$distro" ] || distro=$(uname -sr)
+
+  if [ -d /run/systemd/system ]; then
+    init="systemd"
+  elif command -v launchctl >/dev/null 2>&1; then
+    init="launchd"
+  else
+    init="not systemd"
+  fi
+
+  if [ "$(id -u 2>/dev/null)" = "0" ]; then
+    priv="root"
+  elif command -v sudo >/dev/null 2>&1; then
+    priv="normal user, sudo available"
+  else
+    priv="normal user, no sudo"
+  fi
+
+  tools=""
+  for t in systemctl service docker podman pm2 supervisorctl apt dnf yum pacman apk zypper brew snap flatpak ss git python3 node; do
+    if command -v "$t" >/dev/null 2>&1; then tools="$tools $t"; fi
+  done
+  ENV_FACTS="Distro: $distro | Init: $init | Privilege: $priv | Tools present:${tools:- none}"
+}
+
+# Words that suggest the request is about a service, container or process.
+TRIGGER_WORDS=" stop start restart status service services daemon bot server container containers docker podman process processes kill running logs log reload enable disable systemd systemctl pm2 supervisor supervisorctl worker workers job jobs timer app apps application halt terminate "
+# Words that are never a useful name to search for.
+STOP_WORDS=" the and for with from that this these those you your our please can could would should will not yes are was were been has have had its all any some how what why when where which who does did now then just also into onto over under out off about them they there here down stop start restart status service services daemon container containers docker podman process processes kill running run check show list tell give get find see look logs log reload enable disable systemd systemctl pm2 supervisor supervisorctl command terminal script halt terminate resume pause launch begin end shut turn kick bring "
+# Only used when nothing more specific was said (for example "stop the bot").
+GENERIC_WORDS=" bot bots server servers app apps application daemon worker workers job jobs "
+
+is_in() { # word list(with surrounding spaces)
+  case "$2" in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+extract_keywords() { # request -> $KW_FILE (one keyword per line), KW_N, TRIGGERED
+  KW_FILE="$TMP_DIR/keywords"
+  : >"$KW_FILE"
+  KW_N=0
+  TRIGGERED="false"
+  words=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' ' ')
+  for w in $words; do
+    if is_in "$w" "$TRIGGER_WORDS"; then TRIGGERED="true"; fi
+    [ "$KW_N" -lt 5 ] || continue
+    [ "${#w}" -ge 3 ] || continue
+    is_in "$w" "$STOP_WORDS" && continue
+    is_in "$w" "$GENERIC_WORDS" && continue
+    grep -qx -- "$w" "$KW_FILE" && continue
+    printf '%s\n' "$w" >>"$KW_FILE"
+    KW_N=$((KW_N + 1))
+  done
+  if [ "$KW_N" -eq 0 ] && [ "$TRIGGERED" = "true" ]; then
+    for w in $words; do
+      [ "$KW_N" -lt 5 ] || continue
+      is_in "$w" "$GENERIC_WORDS" || continue
+      grep -qx -- "$w" "$KW_FILE" && continue
+      printf '%s\n' "$w" >>"$KW_FILE"
+      KW_N=$((KW_N + 1))
+    done
+  fi
+}
+
+tmo() { # run a command with a short time limit when "timeout" exists
+  if command -v timeout >/dev/null 2>&1; then timeout 4 "$@"; else "$@"; fi
+}
+
+match() { grep -i -F -f "$KW_FILE"; } # keep only lines containing a keyword
+
+emit() { # title ; stdin = lines to add (max 10)
+  lines=$(head -n 10)
+  [ -z "$lines" ] || printf '%s\n%s\n' "$1" "$lines" >>"$FACTS_FILE"
+}
+
+gather_facts() { # request -> FACTS ("" when not needed)
+  FACTS=""
+  [ -z "${SH_AI_NO_PROBE:-}" ] || return 0
+  extract_keywords "$1"
+  [ "$TRIGGERED" = "true" ] && [ "$KW_N" -gt 0 ] || return 0
+
+  FACTS_FILE="$TMP_DIR/facts.txt"
+  : >"$FACTS_FILE"
+  checked=""
+  kws=$(tr '\n' ' ' <"$KW_FILE")
+  kws=$(trim "$kws")
+
+  # systemd (system units, then user units). Read-only list commands only.
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    checked="$checked systemd"
+    tmo systemctl list-units --type=service --all --no-legend --no-pager --plain 2>/dev/null |
+      awk '{ print $1, $3 "/" $4 }' >"$TMP_DIR/units.txt"
+    match <"$TMP_DIR/units.txt" | emit "systemd system services (name active/sub; use sudo if not root):"
+    tmo systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+      awk 'NR == FNR { s[$1] = 1; next } !($1 in s) { print $1, "(" $2 ")" }' "$TMP_DIR/units.txt" - |
+      match | emit "systemd installed but not loaded (name, enable state):"
+    tmo systemctl --user list-units --type=service --all --no-legend --no-pager --plain 2>/dev/null |
+      awk '{ print $1, $3 "/" $4 }' | match | emit "systemd USER services (use systemctl --user, no sudo):"
+  fi
+
+  # Docker / Podman containers
+  for rt in docker podman; do
+    if command -v "$rt" >/dev/null 2>&1; then
+      checked="$checked $rt"
+      tmo "$rt" ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null | match | emit "$rt containers (name status):"
+    fi
+  done
+
+  # pm2 (only when its daemon is already running, so we never start anything)
+  if command -v pm2 >/dev/null 2>&1 && [ -S "${PM2_HOME:-$HOME/.pm2}/rpc.sock" ]; then
+    checked="$checked pm2"
+    tmo pm2 jlist 2>/dev/null | sed -n '/^\[/,$p' |
+      jq -r '.[]? | "\(.name) \(.pm2_env.status)"' 2>/dev/null | match | emit "pm2 processes (name status; belongs to this user):"
+  fi
+
+  # supervisor
+  if command -v supervisorctl >/dev/null 2>&1; then
+    checked="$checked supervisor"
+    tmo supervisorctl status 2>/dev/null | match | emit "supervisor programs (name status):"
+  fi
+
+  # Running processes: matched on the full command line locally, but only the
+  # pid and the program name are kept (arguments are never sent).
+  checked="$checked processes"
+  {
+    ps -A -o pid= -o comm= -o args= 2>/dev/null || ps -o pid= -o comm= -o args= 2>/dev/null
+  } | match |
+    awk -v self="$$" '$1 != self && $0 !~ /ai\.sh/ && $0 !~ / (grep|ps|awk) / { n = split($2, a, "/"); print "pid " $1 " " a[n] }' |
+    emit "running processes matching (pid program):"
+
+  checked=$(trim "$checked")
+  if [ -s "$FACTS_FILE" ]; then
+    FACTS="LIVE FACTS (read-only lookups on this machine for: $kws). Use these exact names, types and scopes:
+$(cat "$FACTS_FILE")"
+    msg_dim "Looked up '$kws' here. Only the matching names are sent to the model."
+  else
+    FACTS="LIVE FACTS: read-only lookups for '$kws' (checked: $checked) found no match. Do not invent a name. Use ANSWER: to say what was not found, or give one command that lists candidates."
+    msg_dim "Looked up '$kws' here: nothing matched."
+  fi
+  FACTS=$(printf '%s\n' "$FACTS" | cap_text 2500)
+}
+
+# =========================================================================
 # Master prompt (one prompt for every mode)
 # =========================================================================
 build_prompt() {
   OS_INFO=$(uname -s)
   CWD=$(pwd)
   USER_NAME=${USER:-$(id -un 2>/dev/null)}
+  env_facts
   if [ "$MODE" = "convo" ]; then
     if [ "$TEMP_SESSION" = "true" ]; then sess="temporary (not saved)"; else sess="saved as $CONVO_ID"; fi
     MODE_DESC="conversation (session $sess). You may run several commands in a row. After each command you receive its output and exit status, then continue or finish with ANSWER:."
   else
-    MODE_DESC="one-shot. Your single reply is shown to the user. You will NOT see command output, so reply with a command for command tasks and with ANSWER: for questions."
+    MODE_DESC="one-shot. Your reply is shown to the user. You will NOT see command output unless the command fails: then you get the error once and may reply with ONE corrected command (or ANSWER: if it cannot be fixed). Reply with a command for command tasks and with ANSWER: for questions."
+  fi
+
+  FACTS_BLOCK=""
+  if [ -n "$FACTS" ]; then
+    FACTS_BLOCK="
+$FACTS"
   fi
 
   SYSTEM_PROMPT="You are ai.sh, an assistant embedded in the user's POSIX shell terminal. You can chat and you can run shell commands for the user.
@@ -1130,6 +1311,8 @@ RULES:
 - Any reply that does not start with ANSWER: or INTERNAL: is treated as a shell command.
 - Keep ANSWER replies short and clear.
 - Each command runs in a fresh shell, so cd and export do not carry over to the next command. Chain steps with && or use full paths.
+- A LIVE FACTS section may follow the environment line. It was gathered on this machine just now. Trust it over your assumptions: use the exact names it shows and the right tool for each (systemctl, systemctl --user, docker, podman, pm2, supervisorctl, or kill by pid).
+- Use sudo only when really needed (for example system systemd units) and only when the user is not root and sudo exists.
 
 EXAMPLES:
 User: list all files larger than 100MB
@@ -1140,7 +1323,8 @@ User: show my saved conversations
 Reply: INTERNAL: list
 
 MODE: $MODE_DESC
-ENVIRONMENT: OS=$OS_INFO USER=$USER_NAME CWD=$CWD"
+ENVIRONMENT: OS=$OS_INFO USER=$USER_NAME CWD=$CWD
+SYSTEM: $ENV_FACTS$FACTS_BLOCK"
 }
 
 # =========================================================================
@@ -1363,6 +1547,9 @@ internal_cmd() { # "list" | "show <id>" | "delete <id>" -> INT_OUT
 
 # =========================================================================
 # One turn: user input -> model -> (command -> output -> model)* -> answer
+#   One-shot mode gets exactly one retry: if the command fails, the error is
+#   sent back and the model may suggest ONE corrected command, which always
+#   needs your approval (even in yolo mode).
 # =========================================================================
 strip_prefix() {
   printf '%s\n' "$1" | sed -e '1s/^[^:]*:[[:space:]]*//' -e '/./,$!d'
@@ -1370,13 +1557,16 @@ strip_prefix() {
 
 run_turn() { # user text
   printf '\n'
+  gather_facts "$1"
+  build_prompt
   hist_add user "$1" || {
     msg_err "Could not write to history."
     return 1
   }
+  LAST_CMD=""
   step=1
   while [ "$step" -le "$STEPS_LIMIT" ]; do
-    [ "$step" -gt 1 ] && msg_dim "Step $step/$STEPS_LIMIT"
+    if [ "$step" -gt 1 ] && [ "$MODE" = "convo" ]; then msg_dim "Step $step/$STEPS_LIMIT"; fi
     call_model || return 1
     hist_add assistant "$REPLY"
 
@@ -1398,22 +1588,40 @@ $INT_OUT"
       show_cmd "$REPLY"
       first=${REPLY%%[[:space:]]*}
       force=""
+      question="Run it?"
       if [ "$AUTO" = "true" ] && ! command -v "$first" >/dev/null 2>&1; then
         force="force"
         msg_warn "That does not look like a real command, so I am asking first."
       fi
-      if ! approve "Run it?" "$force"; then
+      if [ "$MODE" != "convo" ] && [ "$step" -gt 1 ]; then
+        if [ "$REPLY" = "$LAST_CMD" ]; then
+          msg_warn "The model suggested the same command again, so I did not offer it."
+          return 1
+        fi
+        force="force"
+        question="Run the corrected command?"
+      fi
+      if ! approve "$question" "$force"; then
         if [ "$MODE" = "convo" ]; then
           hist_add user "The user declined to run that command."
         fi
         msg "Skipped."
         return 0
       fi
+      LAST_CMD=$REPLY
       run_cmd "$REPLY"
-      if [ "$MODE" != "convo" ]; then return "$CMD_RC"; fi
-      feedback="COMMAND OUTPUT (exit status $CMD_RC):
+      if [ "$MODE" != "convo" ]; then
+        if [ "$CMD_RC" -eq 0 ] || [ "$step" -ge "$STEPS_LIMIT" ]; then return "$CMD_RC"; fi
+        msg_dim "The command failed. Asking the model for a fix (one retry, you approve it first)."
+        short=$(printf '%s\n' "$CMD_OUT" | tail -n 15 | cut -c 1-300)
+        feedback="THE COMMAND FAILED (exit status $CMD_RC). Last output:
+$short
+Reply with ONE corrected command, or ANSWER: if it cannot be fixed with a command (explain briefly why)."
+      else
+        feedback="COMMAND OUTPUT (exit status $CMD_RC):
 $CMD_OUT
 Continue with the next command, or reply with ANSWER: if you are done."
+      fi
       ;;
     esac
     hist_add user "$feedback"
@@ -1517,7 +1725,7 @@ if [ -z "$QUERY" ]; then
 fi
 
 MODE="oneshot"
-STEPS_LIMIT=1
+STEPS_LIMIT=2 # the command, plus at most one corrected retry after a failure
 HIST="$TMP_DIR/hist.json"
 build_prompt
 run_turn "$QUERY"
