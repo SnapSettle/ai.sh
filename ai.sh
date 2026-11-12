@@ -5,7 +5,7 @@
 
 # VERSION is stamped automatically by .github/workflows/release.yml on every
 # release. Do not edit it by hand ("dev" means "running from a git checkout").
-VERSION="2026.11.10"
+VERSION="2026.10.24.1"
 # package.nix changes this to "nix". Nix installs must never update themselves.
 INSTALL_METHOD="script"
 APP="ai.sh"
@@ -238,7 +238,11 @@ MODES
   One-shot   Sends your request, shows the answer or a suggested command,
              runs it after approval, then exits. If the command fails, the
              error is sent back once and you may get one corrected command
-             (you always approve it, even in auto-approve mode).
+             (you always approve it, even in auto-approve mode). If your
+             request is a question (it has a question mark, a common English
+             question word, or the model decides it needs the output), the
+             command output is also sent back so the model can answer in
+             plain words after showing the output.
   Conversation (--convo, --chat)
              Interactive chat. The model can answer, run several commands in
              a row (seeing their output), and read or delete saved
@@ -278,6 +282,8 @@ ENVIRONMENT VARIABLES
   OLLAMA_HOST            Ollama server URL (overrides the saved host)
   SH_AI_DIR              Override the data directory
   SH_AI_NO_PROBE         Set to any value to turn off the live lookups
+  SH_AI_NO_EXPLAIN       Set to any value to stop sending command output back
+                         to the model for questions in one-shot mode
   SH_AI_NO_UPDATE_CHECK  Set to any value to turn off the daily update notice
   SH_AI_UPDATE_URL       Where --update downloads releases from
   NO_COLOR               Disable colors
@@ -1171,6 +1177,26 @@ is_in() { # word list(with surrounding spaces)
   return 1
 }
 
+# Should the model read the command output and answer, instead of just
+# showing the raw output? Three triggers, none tied to one provider:
+#   1. the model itself starts its command with READ: (works in any language)
+#   2. the request contains a question mark (any language's mark)
+#   3. the request has a common English question word (backup for small models)
+QUESTION_WORDS=" which what whats how why where who whom whose tell explain summarize summarise analyze analyse compare "
+QUESTION_STARTERS=" is are was were do does did can could has have should will "
+wants_explain() { # request -> success when it looks like a question
+  [ -z "${SH_AI_NO_EXPLAIN:-}" ] || return 1
+  case "$1" in *\?* | *？* | *؟* | *¿*) return 0 ;; esac
+  words=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' ' ')
+  first=""
+  for w in $words; do
+    [ -n "$first" ] || first=$w
+    is_in "$w" "$QUESTION_WORDS" && return 0
+  done
+  is_in "$first" "$QUESTION_STARTERS" && return 0
+  return 1
+}
+
 extract_keywords() { # request -> $KW_FILE (one keyword per line), KW_N, TRIGGERED
   KW_FILE="$TMP_DIR/keywords"
   : >"$KW_FILE"
@@ -1288,7 +1314,7 @@ build_prompt() {
     if [ "$TEMP_SESSION" = "true" ]; then sess="temporary (not saved)"; else sess="saved as $CONVO_ID"; fi
     MODE_DESC="conversation (session $sess). You may run several commands in a row. After each command you receive its output and exit status, then continue or finish with ANSWER:."
   else
-    MODE_DESC="one-shot. Your reply is shown to the user. You will NOT see command output unless the command fails: then you get the error once and may reply with ONE corrected command (or ANSWER: if it cannot be fixed). Reply with a command for command tasks and with ANSWER: for questions."
+    MODE_DESC="one-shot. Your reply is shown to the user. You normally do NOT see command output. Two exceptions: (1) if the command fails you get the error once and may reply with ONE corrected command (or ANSWER: if it cannot be fixed); (2) if the user asked a question that needs the output to answer, start your command with READ: and you will receive the output after it runs; you must then reply with ANSWER: giving a short, plain answer based on it (the user sees the raw output too). So for a question, reply with ONE command that gathers the data, keeping its output small."
   fi
 
   FACTS_BLOCK=""
@@ -1313,6 +1339,8 @@ RULES:
 - Each command runs in a fresh shell, so cd and export do not carry over to the next command. Chain steps with && or use full paths.
 - A LIVE FACTS section may follow the environment line. It was gathered on this machine just now. Trust it over your assumptions: use the exact names it shows and the right tool for each (systemctl, systemctl --user, docker, podman, pm2, supervisorctl, or kill by pid).
 - Use sudo only when really needed (for example system systemd units) and only when the user is not root and sudo exists.
+- Keep command output small and easy to read: sort it, cut it down (head, a depth or count limit), hide expected error noise with 2>/dev/null, and do not list a folder together with all of its sub-folders. Do not restrict a search to one filesystem unless asked, because other drives are often mounted inside the tree. Tool flags differ between GNU, BSD and macOS, so only use flags that exist on the OS shown in SYSTEM.
+- If the user asks a question (in any language) that you can only answer by seeing the command output, start your command with READ: (for example READ: df -h). In one-shot mode you then receive the output and answer with ANSWER:.
 
 EXAMPLES:
 User: list all files larger than 100MB
@@ -1564,10 +1592,21 @@ run_turn() { # user text
     return 1
   }
   LAST_CMD=""
+  FIX_USED="false"
+  EXPLAINED="false"
+  EXPLAIN="false"
+  if [ "$MODE" != "convo" ] && wants_explain "$1"; then EXPLAIN="true"; fi
   step=1
   while [ "$step" -le "$STEPS_LIMIT" ]; do
     if [ "$step" -gt 1 ] && [ "$MODE" = "convo" ]; then msg_dim "Step $step/$STEPS_LIMIT"; fi
     call_model || return 1
+    # READ: <command> = "run this and let me read the output to answer".
+    case "$REPLY" in
+    [Rr][Ee][Aa][Dd]:*)
+      REPLY=$(strip_prefix "$REPLY")
+      if [ "$MODE" != "convo" ] && [ -z "${SH_AI_NO_EXPLAIN:-}" ]; then EXPLAIN="true"; fi
+      ;;
+    esac
     hist_add assistant "$REPLY"
 
     case "$REPLY" in
@@ -1599,7 +1638,11 @@ $INT_OUT"
           return 1
         fi
         force="force"
-        question="Run the corrected command?"
+        if [ "$FIX_USED" = "true" ]; then
+          question="Run the corrected command?"
+        else
+          question="Run the follow-up command?"
+        fi
       fi
       if ! approve "$question" "$force"; then
         if [ "$MODE" = "convo" ]; then
@@ -1611,12 +1654,27 @@ $INT_OUT"
       LAST_CMD=$REPLY
       run_cmd "$REPLY"
       if [ "$MODE" != "convo" ]; then
-        if [ "$CMD_RC" -eq 0 ] || [ "$step" -ge "$STEPS_LIMIT" ]; then return "$CMD_RC"; fi
-        msg_dim "The command failed. Asking the model for a fix (one retry, you approve it first)."
-        short=$(printf '%s\n' "$CMD_OUT" | tail -n 15 | cut -c 1-300)
-        feedback="THE COMMAND FAILED (exit status $CMD_RC). Last output:
+        if [ "$CMD_RC" -eq 0 ]; then
+          # Success: for questions, let the model read the output and answer.
+          if [ "$EXPLAIN" != "true" ] || [ "$EXPLAINED" = "true" ] || [ "$step" -ge "$STEPS_LIMIT" ]; then
+            return 0
+          fi
+          EXPLAINED="true"
+          msg_dim "Asking the model to explain the result."
+          short=$(printf '%s\n' "$CMD_OUT" | cut -c 1-300 | cap_text 6000)
+          feedback="COMMAND OUTPUT (exit status 0, long output may be shortened):
+$short
+Now reply with ANSWER: followed by a short, plain-language answer to the user's original question, based on this output. Only reply with another command if the output shows this command did not do what was asked."
+        else
+          # Failure: one corrected command, always approved by the user.
+          if [ "$FIX_USED" = "true" ] || [ "$step" -ge "$STEPS_LIMIT" ]; then return "$CMD_RC"; fi
+          FIX_USED="true"
+          msg_dim "The command failed. Asking the model for a fix (one retry, you approve it first)."
+          short=$(printf '%s\n' "$CMD_OUT" | tail -n 15 | cut -c 1-300)
+          feedback="THE COMMAND FAILED (exit status $CMD_RC). Last output:
 $short
 Reply with ONE corrected command, or ANSWER: if it cannot be fixed with a command (explain briefly why)."
+        fi
       else
         feedback="COMMAND OUTPUT (exit status $CMD_RC):
 $CMD_OUT
@@ -1725,7 +1783,7 @@ if [ -z "$QUERY" ]; then
 fi
 
 MODE="oneshot"
-STEPS_LIMIT=2 # the command, plus at most one corrected retry after a failure
+STEPS_LIMIT=3 # command, then at most one fix after a failure and/or one explanation
 HIST="$TMP_DIR/hist.json"
 build_prompt
 run_turn "$QUERY"
