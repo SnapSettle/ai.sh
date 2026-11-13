@@ -3,9 +3,10 @@
 # Modes: one-shot (default) and conversation (--chat / --convo).
 # Requires: curl, jq (plus standard POSIX tools). See README.md and --help.
 
-# VERSION is stamped automatically by .github/workflows/release.yml on every
-# release. Do not edit it by hand ("dev" means "running from a git checkout").
-VERSION="2026.11.12"
+# The repository always keeps "dev" here ("dev" means "running from a git
+# checkout"). .github/workflows/release.yml writes the real date version into
+# the released copy and its tag only, never onto main. Do not edit it by hand.
+VERSION="dev"
 # package.nix changes this to "nix". Nix installs must never update themselves.
 INSTALL_METHOD="script"
 APP="ai.sh"
