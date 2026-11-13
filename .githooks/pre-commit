@@ -1,0 +1,40 @@
+#!/bin/sh
+# pre-commit: a friendly warning when the remote has new commits you do not
+# have yet, so you can update BEFORE conflicts pile up.
+#
+# It NEVER blocks a commit and never changes your files. If anything is off
+# (offline, slow network, no remote, mid-rebase) it stays silent and the commit
+# goes through as normal.
+#
+# Git does not run hooks from a clone automatically, so each contributor turns
+# this one on once per clone:
+#     git config core.hooksPath .githooks
+
+gitdir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+
+# Do nothing while a rebase, merge, cherry-pick or revert is in progress.
+for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+  [ -e "$gitdir/$f" ] && exit 0
+done
+
+# Only branches that track a remote branch can be compared.
+upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || exit 0
+
+# Never hang or ask for a password: give up quickly if the network is slow.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o ConnectTimeout=5"
+if command -v timeout >/dev/null 2>&1; then
+  timeout 8 git fetch --quiet 2>/dev/null || exit 0
+else
+  git fetch --quiet 2>/dev/null || exit 0
+fi
+
+behind=$(git rev-list --count "HEAD..$upstream" 2>/dev/null) || exit 0
+[ "${behind:-0}" -gt 0 ] || exit 0
+
+{
+  echo "Heads up: $upstream has $behind new commit(s) you do not have yet."
+  echo "Your commit will still go through. To avoid conflicts, update before you push:"
+  echo "    git pull --rebase --autostash"
+} >&2
+exit 0

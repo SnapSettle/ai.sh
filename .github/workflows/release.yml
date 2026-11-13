@@ -1,10 +1,13 @@
 # Automatic releases. Every push to main that changes ai.sh:
 #   1. checks the script,
 #   2. picks a date version (2026.10.25, or 2026.10.25.1 for a second release that day),
-#   3. writes that version into ai.sh and commits it back,
-#   4. tags it and publishes a GitHub Release with the files the installer and
+#   3. writes that version into ai.sh and commits it ONLY under the release tag.
+#      The main branch is never changed by this workflow, so your local copy of
+#      main never falls behind (or conflicts) because of a release,
+#   4. publishes a GitHub Release with the files the installer and
 #      "ai.sh --update" download.
-# You never edit the version yourself. Nix users get the same stamped file.
+# The repository itself keeps VERSION="dev" in ai.sh. You never edit the version
+# yourself. Nix users get the stamped file from the release tag.
 name: Release
 
 on:
@@ -22,7 +25,7 @@ permissions:
 
 jobs:
   release:
-    # Do not react to the bot's own version commit.
+    # Safety guard: never react to pushes made by the bot itself.
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
@@ -61,17 +64,18 @@ jobs:
           cd dist
           sha256sum ai.sh > ai.sh.sha256
 
-      - name: Commit the stamped version and tag it
+      # Only the TAG is pushed. The stamped commit hangs off main but is not on
+      # it, so main stays exactly as the developer left it.
+      - name: Commit the stamped version under the tag only
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add ai.sh
-          git commit -m "release: v$VERSION [skip ci]"
-          git pull --rebase origin main
+          git commit -m "release: v$VERSION"
           git tag "v$VERSION"
-          git push origin HEAD:main "v$VERSION"
+          git push origin "v$VERSION"
 
       - name: Publish the GitHub Release
         env:
