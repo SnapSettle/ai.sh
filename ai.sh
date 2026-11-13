@@ -25,6 +25,8 @@ HIST=""
 CONVO_ID=""
 MODE="oneshot"
 ENV_FACTS=""
+PATH_FACTS=""
+HINT=""
 FACTS=""
 
 # =========================================================================
@@ -284,6 +286,9 @@ ENVIRONMENT VARIABLES
   SH_AI_NO_PROBE         Set to any value to turn off the live lookups
   SH_AI_NO_EXPLAIN       Set to any value to stop sending command output back
                          to the model for questions in one-shot mode
+  SH_AI_NO_PATHS         Set to any value to stop sending folder names (your
+                         home folder, the current folder, and the nearest
+                         real folder after a wrong path) to the model
   SH_AI_NO_UPDATE_CHECK  Set to any value to turn off the daily update notice
   SH_AI_UPDATE_URL       Where --update downloads releases from
   NO_COLOR               Disable colors
@@ -1159,10 +1164,127 @@ env_facts() { # sets ENV_FACTS once
   fi
 
   tools=""
-  for t in systemctl service docker podman pm2 supervisorctl apt dnf yum pacman apk zypper brew snap flatpak ss git python3 node; do
+  for t in systemctl service docker podman pm2 supervisorctl apt dnf yum pacman apk zypper brew nix snap flatpak ss git python3 node; do
     if command -v "$t" >/dev/null 2>&1; then tools="$tools $t"; fi
   done
   ENV_FACTS="Distro: $distro | Init: $init | Privilege: $priv | Tools present:${tools:- none}"
+}
+
+# Real folder names, so the model does not guess paths (paths are case
+# sensitive and folder names differ per language: Documents, Dokumente, ...).
+# Names only, capped, computed once. Turn off with SH_AI_NO_PATHS.
+path_facts() { # sets PATH_FACTS
+  [ -z "$PATH_FACTS" ] || return 0
+  [ -z "${SH_AI_NO_PATHS:-}" ] || return 0
+  [ -n "${HOME:-}" ] || return 0
+  n=0
+  names=""
+  for d in "$HOME"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    d=${d##*/}
+    [ "${#d}" -le 80 ] || continue
+    n=$((n + 1))
+    if [ "$n" -gt 40 ]; then
+      names="$names, ..."
+      break
+    fi
+    names="$names${names:+, }$d"
+  done
+  PATH_FACTS="Home folder $HOME contains these folders: ${names:-none}"
+  here=$(pwd)
+  if [ "$here" != "$HOME" ]; then
+    n=0
+    list=""
+    for e in ./*; do
+      [ -e "$e" ] || continue
+      e=${e#./}
+      [ "${#e}" -le 80 ] || continue
+      n=$((n + 1))
+      if [ "$n" -gt 25 ]; then
+        list="$list, ..."
+        break
+      fi
+      [ -d "$e" ] && e="$e/"
+      list="$list${list:+, }$e"
+    done
+    PATH_FACTS="$PATH_FACTS | Current folder $here contains: ${list:-nothing}"
+  fi
+}
+
+nearest_dir() { # path -> prints the deepest folder of it that exists
+  p=$1
+  while [ ! -d "$p" ]; do
+    case "$p" in
+    */*)
+      p=${p%/*}
+      [ -n "$p" ] || p="/"
+      ;;
+    *) p="." ;;
+    esac
+  done
+  printf '%s' "$p"
+}
+
+# After a failed command: if it used a path that does not exist, look (locally,
+# read-only) at the nearest folder that does exist and tell the model what is
+# really there. Works from the command text, so it does not depend on the
+# language of the error message. Sets HINT ("" when nothing to add).
+path_hint() { # command
+  HINT=""
+  [ -z "${SH_AI_NO_PATHS:-}" ] || return 0
+  cnt=0
+  set -f # no wildcard expansion while splitting the command into words
+  for tok in $1; do
+    set +f # the word list is already built; wildcards are needed again below
+    [ "$cnt" -lt 3 ] || break
+    while :; do
+      case "$tok" in \"* | \'*) tok=${tok#?} ;; *) break ;; esac
+    done
+    while :; do
+      case "$tok" in *\" | *\' | *\; | *\| | *\& | *\) | *\>) tok=${tok%?} ;; *) break ;; esac
+    done
+    case "$tok" in
+    '~/'*) tok="${HOME:-}/${tok#'~/'}" ;;
+    '$HOME/'*) tok="${HOME:-}/${tok#'$HOME/'}" ;;
+    '${HOME}/'*) tok="${HOME:-}/${tok#'${HOME}/'}" ;;
+    /* | ./* | ../*) ;;
+    *) continue ;;
+    esac
+    case "$tok" in *'$'* | *'*'* | *'?'* | *'['* | *'`'*) continue ;; esac
+    if [ -e "$tok" ] || [ -L "$tok" ]; then continue; fi
+    cnt=$((cnt + 1))
+    near=$(nearest_dir "$tok")
+    rest=${tok#"$near"}
+    rest=${rest#/}
+    miss=${rest%%/*}
+    shown=""
+    plain=""
+    n=0
+    for e in "$near"/*; do
+      [ -e "$e" ] || continue
+      e=${e##*/}
+      n=$((n + 1))
+      if [ "$n" -gt 30 ]; then
+        shown="$shown, ..."
+        break
+      fi
+      plain="$plain$e
+"
+      if [ -d "$near/$e" ]; then shown="$shown${shown:+, }$e/"; else shown="$shown${shown:+, }$e"; fi
+    done
+    match=$(printf '%s' "$plain" | awk -v w="$miss" 'tolower($0) == tolower(w) { print; exit }')
+    line="Path check: '$tok' does not exist. The nearest folder that exists, '$near', contains: ${shown:-nothing}."
+    if [ -n "$match" ] && [ "$match" != "$miss" ]; then
+      line="$line Same name with different upper/lower case: '$match'."
+    fi
+    HINT="$HINT$line
+"
+  done
+  set +f
+  HINT=$(printf '%s' "$HINT" | cap_text 1500)
+  [ -z "$HINT" ] || HINT="$HINT
+"
 }
 
 # Words that suggest the request is about a service, container or process.
@@ -1310,6 +1432,12 @@ build_prompt() {
   CWD=$(pwd)
   USER_NAME=${USER:-$(id -un 2>/dev/null)}
   env_facts
+  path_facts
+  PATHS_BLOCK=""
+  if [ -n "$PATH_FACTS" ]; then
+    PATHS_BLOCK="
+FOLDERS: $PATH_FACTS"
+  fi
   if [ "$MODE" = "convo" ]; then
     if [ "$TEMP_SESSION" = "true" ]; then sess="temporary (not saved)"; else sess="saved as $CONVO_ID"; fi
     MODE_DESC="conversation (session $sess). You may run several commands in a row. After each command you receive its output and exit status, then continue or finish with ANSWER:."
@@ -1339,6 +1467,7 @@ RULES:
 - Each command runs in a fresh shell, so cd and export do not carry over to the next command. Chain steps with && or use full paths.
 - A LIVE FACTS section may follow the environment line. It was gathered on this machine just now. Trust it over your assumptions: use the exact names it shows and the right tool for each (systemctl, systemctl --user, docker, podman, pm2, supervisorctl, or kill by pid).
 - Use sudo only when really needed (for example system systemd units) and only when the user is not root and sudo exists.
+- Paths are case sensitive. Use folder names exactly as written in FOLDERS. Never invent a path: if you are not sure where something is, locate it first (for example find DIR -maxdepth 4 -iname 'name') in the same command.
 - Keep command output small and easy to read: sort it, cut it down (head, a depth or count limit), hide expected error noise with 2>/dev/null, and do not list a folder together with all of its sub-folders. Do not restrict a search to one filesystem unless asked, because other drives are often mounted inside the tree. Tool flags differ between GNU, BSD and macOS, so only use flags that exist on the OS shown in SYSTEM.
 - If the user asks a question (in any language) that you can only answer by seeing the command output, start your command with READ: (for example READ: df -h). In one-shot mode you then receive the output and answer with ANSWER:.
 
@@ -1352,7 +1481,7 @@ Reply: INTERNAL: list
 
 MODE: $MODE_DESC
 ENVIRONMENT: OS=$OS_INFO USER=$USER_NAME CWD=$CWD
-SYSTEM: $ENV_FACTS$FACTS_BLOCK"
+SYSTEM: $ENV_FACTS$PATHS_BLOCK$FACTS_BLOCK"
 }
 
 # =========================================================================
@@ -1387,6 +1516,30 @@ should_retry() { # curl-exit-code response -> success if the problem is probably
   *) return 1 ;;
   esac
   printf '%s' "$2" | jq -e '[(.error.type? // ""), (.error.code? // "")] | map(tostring) | any(test("overloaded|rate_limit|server_error|api_error"))' >/dev/null 2>&1
+}
+
+strip_think() { # removes <think>...</think> blocks (also when they span lines)
+  awk '
+    {
+      s = $0
+      while (1) {
+        if (inthink) {
+          i = index(s, "</think>")
+          if (i == 0) { s = ""; break }
+          s = substr(s, i + 8)
+          inthink = 0
+        } else {
+          i = index(s, "<think>")
+          if (i == 0) break
+          pre = substr(s, 1, i - 1)
+          rest = substr(s, i + 7)
+          j = index(rest, "</think>")
+          if (j == 0) { s = pre; inthink = 1; break }
+          s = pre substr(rest, j + 8)
+        }
+      }
+      print s
+    }'
 }
 
 call_model() {
@@ -1463,8 +1616,38 @@ call_model() {
     return 1
   fi
 
+  # Some local models "think out loud" inside <think>...</think>. Drop that, or
+  # it would be mistaken for a shell command.
+  case "$REPLY" in
+  *"<think>"*) REPLY=$(printf '%s\n' "$REPLY" | strip_think) ;;
+  *"</think>"*) REPLY=${REPLY##*"</think>"} ;;
+  esac
+
   # Strip stray markdown fences and leading blank lines
   REPLY=$(printf '%s\n' "$REPLY" | sed -e '/^[[:space:]]*```/d' -e '/./,$!d')
+
+  # Small models often add a label in front of the command: "$ ls", "Reply: ls",
+  # "Command: ls". Remove it (twice, for "Reply: $ ls"). ANSWER:/INTERNAL:/READ:
+  # are different words and are left alone.
+  REPLY=$(printf '%s\n' "$REPLY" | sed -e '1s/^[[:space:]]*\(\$[[:space:]][[:space:]]*\|[Rr][Ee][Pp][Ll][Yy]:[[:space:]]*\|[Cc][Oo][Mm][Mm][Aa][Nn][Dd]:[[:space:]]*\)//' -e '1s/^[[:space:]]*\(\$[[:space:]][[:space:]]*\|[Rr][Ee][Pp][Ll][Yy]:[[:space:]]*\|[Cc][Oo][Mm][Mm][Aa][Nn][Dd]:[[:space:]]*\)//')
+
+  # A whole one-line command wrapped in single backticks: `ls -la`
+  case "$REPLY" in
+  '`'*'`')
+    case "$REPLY" in
+    *'
+'*) ;;
+    *)
+      bt=$(printf '%s' "$REPLY" | tr -cd '`' | wc -c)
+      if [ "$bt" -eq 2 ]; then
+        REPLY=${REPLY#'`'}
+        REPLY=${REPLY%'`'}
+      fi
+      ;;
+    esac
+    ;;
+  esac
+
   [ -n "$REPLY" ] || {
     msg_err "The model returned an empty reply."
     return 1
@@ -1653,6 +1836,11 @@ $INT_OUT"
       fi
       LAST_CMD=$REPLY
       run_cmd "$REPLY"
+      HINT=""
+      if [ "$CMD_RC" -ne 0 ]; then
+        path_hint "$REPLY"
+        if [ -n "$HINT" ]; then msg_dim "A path in that command does not exist. Sending the nearest real folder names to the model."; fi
+      fi
       if [ "$MODE" != "convo" ]; then
         if [ "$CMD_RC" -eq 0 ]; then
           # Success: for questions, let the model read the output and answer.
@@ -1673,12 +1861,12 @@ Now reply with ANSWER: followed by a short, plain-language answer to the user's 
           short=$(printf '%s\n' "$CMD_OUT" | tail -n 15 | cut -c 1-300)
           feedback="THE COMMAND FAILED (exit status $CMD_RC). Last output:
 $short
-Reply with ONE corrected command, or ANSWER: if it cannot be fixed with a command (explain briefly why)."
+${HINT}Reply with ONE corrected command, or ANSWER: if it cannot be fixed with a command (explain briefly why)."
         fi
       else
         feedback="COMMAND OUTPUT (exit status $CMD_RC):
 $CMD_OUT
-Continue with the next command, or reply with ANSWER: if you are done."
+${HINT}Continue with the next command, or reply with ANSWER: if you are done."
       fi
       ;;
     esac
