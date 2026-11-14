@@ -1245,6 +1245,9 @@ path_hint() { # command
     while :; do
       case "$tok" in *\" | *\' | *\; | *\| | *\& | *\) | *\>) tok=${tok%?} ;; *) break ;; esac
     done
+    # The quoted '~/' is deliberate: we match the literal characters the model
+    # wrote and expand them ourselves to $HOME.
+    # shellcheck disable=SC2088
     case "$tok" in
     '~/'*) tok="${HOME:-}/${tok#'~/'}" ;;
     '$HOME/'*) tok="${HOME:-}/${tok#'$HOME/'}" ;;
