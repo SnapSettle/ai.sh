@@ -7,7 +7,7 @@
 #   4. publishes a GitHub Release with the files the installer and
 #      "ai.sh --update" download.
 # The repository itself keeps VERSION="dev" in ai.sh. You never edit the version
-# yourself. Nix users get the stamped file from the release tag.
+# yourself. The Nix package builds straight from the repository, so it reports "dev".
 name: Release
 
 on:
