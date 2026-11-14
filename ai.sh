@@ -6,7 +6,7 @@
 # The repository always keeps "dev" here ("dev" means "running from a git
 # checkout"). .github/workflows/release.yml writes the real date version into
 # the released copy and its tag only, never onto main. Do not edit it by hand.
-VERSION="dev"
+VERSION="2026.11.14"
 # package.nix changes this to "nix". Nix installs must never update themselves.
 INSTALL_METHOD="script"
 APP="ai.sh"
