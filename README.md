@@ -142,25 +142,49 @@ ai.sh --chat [options] ["message"] Conversation mode
 Inside a chat: `/exit` leaves (chat is kept), `/delete` leaves and deletes it, `/help` lists commands.
 
 Environment variables: `SH_AI_PROVIDER`, `SH_AI_MODEL`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`OLLAMA_HOST`, `SH_AI_DIR`, `SH_AI_NO_UPDATE_CHECK`, `NO_COLOR`.
+`OLLAMA_HOST`, `SH_AI_DIR`, `SH_AI_NO_UPDATE_CHECK`, `SH_AI_NO_PROBE`, `SH_AI_NO_EXPLAIN`,
+`SH_AI_NO_PATHS`, `NO_COLOR`.
 
 Settings and chats live in `~/.cache/ai.sh` (or `$SH_AI_DIR`). The config file is readable only by you.
 
 ### Safety
 
 - Commands are shown and **need your approval** unless you use `-y`.
-- Even with `-y`, anything that does not look like a real command, and every chat deletion, still asks first.
+- Even with `-y`, anything that does not look like a real command, a corrected command offered after a failure (one-shot mode), and every chat deletion still asks first.
 - You are running commands an AI wrote. Read them, especially with `-y`.
+
+### What is sent to the model
+
+To get commands right the first time, ai.sh sends your provider some context along with your request:
+
+- your OS, distro, whether you are root, and which common tools are installed
+- the names (only the names) of the folders in your home folder and of the entries in the current folder
+- for requests about services, containers or processes: the few matching names found by quick read-only lookups on your machine
+- command output, only when needed: the last lines after a failed command, the output of a command when you asked a question (so it can answer), and the output of every command in chat mode
+- after a command fails on a path that does not exist: the names inside the nearest folder that does exist
+
+With Ollama all of this stays on your machine. Turn parts off with `SH_AI_NO_PATHS=1` (folder names), `SH_AI_NO_PROBE=1` (service and process lookups) and `SH_AI_NO_EXPLAIN=1` (sending output back to answer questions).
 
 ## Versions
 
 Versions are dates: `2026.10.25`, or `2026.10.25.1` for a second release on the same day.
 Every release is on the [Releases page](https://github.com/snapsettle/ai.sh/releases).
-`ai.sh --version` shows what you have. A copy run straight from a git checkout shows `dev`.
+`ai.sh --version` shows what you have. A copy run straight from a git checkout, or built from the Nix package, shows `dev`.
 
 ## How releases work - Maintainers only
 
 1. Edit `ai.sh` and push to `main`.
 2. GitHub Actions (`.github/workflows/release.yml`) checks the script, picks today's date as the version,
-   writes it into `ai.sh`, commits it back, tags `vYYYY.MM.DD`, and publishes a Release.
+   writes it into a copy of `ai.sh`, commits that copy **only under the release tag** `vYYYY.MM.DD`, and publishes a Release.
+   `main` is never changed by a release and always keeps `VERSION="dev"`, so your local copy never falls behind because of one.
 3. One-liner users get it via `ai.sh --update`. Nix users get it when they update their input / rebuild.
+
+## Contributing
+
+Optional but recommended: turn on the repo's commit hook. It warns you when GitHub has new commits you do not have yet, so you can update before conflicts pile up. It never blocks a commit and never touches your files. Git does not enable hooks from a clone by itself, so run this once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+To update your copy before you start working: `git pull --rebase --autostash`.
