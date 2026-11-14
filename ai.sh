@@ -3,10 +3,10 @@
 # Modes: one-shot (default) and conversation (--chat / --convo).
 # Requires: curl, jq (plus standard POSIX tools). See README.md and --help.
 
-# The repository always keeps "dev" here ("dev" means "running from a git
-# checkout"). .github/workflows/release.yml writes the real date version into
-# the released copy and its tag only, never onto main. Do not edit it by hand.
-VERSION="dev"
+# The release version. Raise it by hand whenever you change this script (a date:
+# 2026.11.15, or 2026.11.15.1 for a second release that day). Pushing to main
+# publishes a release for exactly this number (.github/workflows/release.yml).
+VERSION="2026.11.15"
 # package.nix changes this to "nix". Nix installs must never update themselves.
 INSTALL_METHOD="script"
 APP="ai.sh"

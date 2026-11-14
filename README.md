@@ -169,19 +169,23 @@ With Ollama all of this stays on your machine. Turn parts off with `SH_AI_NO_PAT
 
 Versions are dates: `2026.10.25`, or `2026.10.25.1` for a second release on the same day.
 Every release is on the [Releases page](https://github.com/snapsettle/ai.sh/releases).
-`ai.sh --version` shows what you have. A copy run straight from a git checkout, or built from the Nix package, shows `dev`.
+`ai.sh --version` shows what you have. The version is written in one place: the `VERSION=` line near the top of `ai.sh`.
 
 ## How releases work - Maintainers only
 
-1. Edit `ai.sh` and push to `main`.
-2. GitHub Actions (`.github/workflows/release.yml`) checks the script, picks today's date as the version,
-   writes it into a copy of `ai.sh`, commits that copy **only under the release tag** `vYYYY.MM.DD`, and publishes a Release.
-   `main` is never changed by a release and always keeps `VERSION="dev"`, so your local copy never falls behind because of one.
-3. One-liner users get it via `ai.sh --update`. Nix users get it when they update their input / rebuild.
+1. Edit `ai.sh` and raise the `VERSION=` line near the top (today's date, or add `.1` for a second release on the same day).
+2. Commit and push to `main`. That is all.
+3. GitHub Actions (`.github/workflows/release.yml`) checks the script, reads the version you wrote,
+   checks that it is new and higher than every earlier release, and publishes a Release for exactly the commit you pushed.
+   It never writes to the repository, so your local copy never falls behind because of a release.
+4. One-liner users get it via `ai.sh --update`. Nix users get it when they update their input / rebuild.
+
+If you push a change to `ai.sh` without raising the version, the release job fails with a message saying so.
+Raise the version, commit and push again.
 
 ## Contributing
 
-Optional but recommended: turn on the repo's commit hook. It warns you when GitHub has new commits you do not have yet, so you can update before conflicts pile up. It never blocks a commit and never touches your files. Git does not enable hooks from a clone by itself, so run this once per clone:
+Always remember to bump the version when proposing changes. Optional but recommended: turn on the repo's commit hook. It warns you when GitHub has new commits you do not have yet, so you can update before conflicts pile up. It never blocks a commit and never touches your files. Git does not enable hooks from a clone by itself, so run this once per clone:
 
 ```sh
 git config core.hooksPath .githooks

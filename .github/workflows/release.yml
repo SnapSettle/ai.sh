@@ -1,13 +1,12 @@
 # Automatic releases. Every push to main that changes ai.sh:
 #   1. checks the script,
-#   2. picks a date version (2026.10.25, or 2026.10.25.1 for a second release that day),
-#   3. writes that version into ai.sh and commits it ONLY under the release tag.
-#      The main branch is never changed by this workflow, so your local copy of
-#      main never falls behind (or conflicts) because of a release,
-#   4. publishes a GitHub Release with the files the installer and
-#      "ai.sh --update" download.
-# The repository itself keeps VERSION="dev" in ai.sh. You never edit the version
-# yourself. The Nix package builds straight from the repository, so it reports "dev".
+#   2. reads the version you wrote in ai.sh (the VERSION= line near the top),
+#   3. makes sure it is a new, higher version than every earlier release,
+#   4. publishes a GitHub Release for exactly the commit you pushed, with the
+#      files the installer and "ai.sh --update" download.
+# This workflow never writes to the repository, so your local copy never falls
+# behind because of a release. The only thing you do is raise VERSION in ai.sh
+# when you change the script.
 name: Release
 
 on:
@@ -25,8 +24,6 @@ permissions:
 
 jobs:
   release:
-    # Safety guard: never react to pushes made by the bot itself.
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,21 +35,31 @@ jobs:
           sh -n ai.sh
           shellcheck -S warning ai.sh
 
-      - name: Pick the version
+      - name: Read and check the version
         id: ver
         run: |
-          day=$(date -u +%Y.%m.%d)
-          n=$(git tag -l "v$day" "v$day.*" | wc -l)
-          if [ "$n" -eq 0 ]; then version="$day"; else version="$day.$n"; fi
+          version=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' ai.sh | head -n 1)
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then
+            echo "::error::The VERSION= line near the top of ai.sh says '$version'. It must be a date version such as 2026.11.15 or 2026.11.15.1."
+            exit 1
+          fi
+          if [ "$(sh ./ai.sh --version)" != "ai.sh $version" ]; then
+            echo "::error::ai.sh does not report the version written in its VERSION= line."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "::error::Version $version is already released. You changed ai.sh without raising the VERSION= line near the top. Raise it (for example to a later date, or add .1), commit and push again."
+            exit 1
+          fi
+          latest=$(git tag -l 'v[0-9]*' | sed 's/^v//' | sort -V | tail -n 1)
+          if [ -n "$latest" ]; then
+            top=$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -n 1)
+            if [ "$top" != "$version" ]; then
+              echo "::error::Version $version is lower than the latest release ($latest). Versions must only go up. Raise the VERSION= line in ai.sh, commit and push again."
+              exit 1
+            fi
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Stamp the version into ai.sh
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
-        run: |
-          sed -i "s/^VERSION=.*/VERSION=\"$VERSION\"/" ai.sh
-          sh -n ai.sh
-          test "$(sh ./ai.sh --version)" = "ai.sh $VERSION"
 
       - name: Build release files
         env:
@@ -64,23 +71,10 @@ jobs:
           cd dist
           sha256sum ai.sh > ai.sh.sha256
 
-      # Only the TAG is pushed. The stamped commit hangs off main but is not on
-      # it, so main stays exactly as the developer left it.
-      - name: Commit the stamped version under the tag only
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ai.sh
-          git commit -m "release: v$VERSION"
-          git tag "v$VERSION"
-          git push origin "v$VERSION"
-
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           gh release create "v$VERSION" dist/ai.sh dist/ai.sh.sha256 dist/VERSION \
-            --title "v$VERSION" --generate-notes
+            --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
